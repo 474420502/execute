@@ -1,4 +1,4 @@
-package execute
+package triggered
 
 import (
 	"fmt"
@@ -27,11 +27,17 @@ type eventExecute[PARAMS any] struct {
 	// 是否打印恢复日志
 	isShowLog atomic.Bool
 
+	shared any
 	// 要执行的函数
-	execDo func(params *PARAMS)
+	execDo func(params *Params[PARAMS])
 
 	// 错误恢复函数
 	recoverDo func(ierr any)
+}
+
+type Params[T any] struct {
+	Value  *T
+	Shared any
 }
 
 // EventTriggeredExecute 包含已注册的执行事件列表
@@ -49,9 +55,17 @@ func NewEventTriggeredExecute[PARAMS any]() *EventTriggeredExecute[PARAMS] {
 	return &EventTriggeredExecute[PARAMS]{}
 }
 
+func (be *EventTriggeredExecute[PARAMS]) SetShared(e Event, v any) {
+	// 加锁
+	be.mu.Lock()
+	defer be.mu.Unlock()
+
+	be.events[e].shared = v
+}
+
 // RegisterExecute注册一个执行单元
 // 返回分配的事件号
-func (be *EventTriggeredExecute[PARAMS]) RegisterExecute(execDo func(params *PARAMS), recoverDo func(ierr any)) Event {
+func (be *EventTriggeredExecute[PARAMS]) RegisterExecute(execDo func(params *Params[PARAMS]), recoverDo func(ierr any)) Event {
 
 	// 加锁
 	be.mu.Lock()
@@ -75,7 +89,7 @@ func (be *EventTriggeredExecute[PARAMS]) RegisterExecute(execDo func(params *PAR
 
 // CoverExecute用来覆盖一个已注册的执行单元
 // 通过事件号定位并替换为新函数
-func (be *EventTriggeredExecute[PARAMS]) CoverExecute(e Event, execDo func(params *PARAMS), recoverDo func(ierr any)) {
+func (be *EventTriggeredExecute[PARAMS]) CoverExecute(e Event, execDo func(params *Params[PARAMS]), recoverDo func(ierr any)) {
 
 	// 加锁
 	be.mu.Lock()
@@ -142,7 +156,10 @@ func (be *EventTriggeredExecute[PARAMS]) Notify(e Event, params *PARAMS) {
 			}()
 
 			// 执行已注册函数
-			exec.execDo(params)
+			exec.execDo(&Params[PARAMS]{
+				Shared: exec.shared,
+				Value:  params,
+			})
 		}()
 	}
 }

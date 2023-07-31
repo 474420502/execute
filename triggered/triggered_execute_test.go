@@ -1,4 +1,4 @@
-package execute
+package triggered
 
 import (
 	"log"
@@ -13,7 +13,7 @@ func TestA1(t *testing.T) {
 
 	b := atomic.Int64{}
 
-	var CountBoy Event = be.RegisterExecute(func(params *int) {
+	var CountBoy Event = be.RegisterExecute(func(params *Params[int]) {
 		b.Add(1)
 		time.Sleep(time.Second)
 	}, nil)
