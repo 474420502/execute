@@ -14,7 +14,7 @@ func TestA1(t *testing.T) {
 	var CountBoy = RegisterExecute[int](func(params *Params[int]) {
 		b.Add(1)
 		time.Sleep(time.Second)
-	}, nil)
+	})
 
 	for i := 0; i < 30; i++ {
 		CountBoy.Notify(nil)
@@ -34,7 +34,7 @@ func TestA2(t *testing.T) {
 	var CountBoy = RegisterExecute[int](func(params *Params[int]) {
 		b.Add(1)
 		time.Sleep(time.Second)
-	}, nil)
+	})
 
 	CountBoy.SetConcurrentNum(2)
 
