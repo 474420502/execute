@@ -13,7 +13,6 @@ type ThresholdExecute[ITEM any] struct {
 
 	once *sync.Once
 
-	timeSignal chan struct{}
 	sizeSignal chan []ITEM
 
 	itemSizeDo     func(i int, item ITEM)
@@ -35,7 +34,6 @@ func NewThresholdExecute[ITEM any](itemDo func(i int, item ITEM)) *ThresholdExec
 		itemDo: itemDo,
 		once:   &sync.Once{},
 
-		timeSignal: make(chan struct{}),
 		sizeSignal: make(chan []ITEM),
 		stopSignal: make(chan struct{}),
 	}
@@ -58,10 +56,12 @@ func (exec *ThresholdExecute[ITEM]) AsyncExecute() *ThresholdExecute[ITEM] {
 		var itemPeriodicDo func(i int, item ITEM)
 		var itemSizeDo func(i int, item ITEM)
 
+		overTimer := time.NewTicker(exec.periodic)
+
 		for {
 
 			exec.mu.Lock()
-			overTimer := time.NewTimer(exec.periodic)
+
 			if exec.itemPeriodicDo != nil {
 				itemPeriodicDo = exec.itemPeriodicDo
 			} else {
