@@ -19,6 +19,6 @@
 
 # Go workspace file
 go.work
-
+*.txt
 
 __debug_bin
