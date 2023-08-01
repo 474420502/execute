@@ -11,11 +11,11 @@ import (
 type ExecuteInterval[ITEM any] struct {
 	periodic time.Duration // 周期的时间
 
-	items []*ITEM
+	items []ITEM
 	mu    sync.Mutex
 
 	// 要执行的函数
-	execDo func(i int, item *ITEM)
+	execDo func(i int, item ITEM)
 
 	// 错误恢复函数
 	recoverDo func(ierr any)
@@ -28,9 +28,9 @@ type ExecuteInterval[ITEM any] struct {
 	stopSignal chan struct{}
 }
 
-func NewExecuteInterval[ITEM any](periodic time.Duration, execDo func(i int, item *ITEM)) *ExecuteInterval[ITEM] {
+func NewExecuteInterval[ITEM any](execDo func(i int, item ITEM)) *ExecuteInterval[ITEM] {
 	e := &ExecuteInterval[ITEM]{
-		periodic:   periodic,
+		periodic:   time.Millisecond * 100,
 		execDo:     execDo,
 		once:       &sync.Once{},
 		stopSignal: make(chan struct{}),
@@ -79,27 +79,48 @@ func (pe *ExecuteInterval[ITEM]) asyncExecuteInterval() {
 
 	//  总执行时间 = 周期时间 + 执行时间
 	go pe.once.Do(func() {
+		pe.execStatus.Store(1)
 		defer func() {
-			pe.stopSignal <- struct{}{}
+			pe.mu.Lock()
+			pe.once = &sync.Once{}
+			pe.mu.Unlock()
+			pe.execStatus.CompareAndSwap(1, 0)
 		}()
 
 		for pe.execStatus.Load() != 0 {
-			time.AfterFunc(pe.periodic, func() {
-				pe.batchHandler()
-			})
+			pe.mu.Lock()
+			periodic := pe.periodic
+			pe.mu.Unlock()
+
+			pe.batchHandler()
+			time.Sleep(periodic)
 		}
 	})
 }
 
-func (pe *ExecuteInterval[ITEM]) SetRecover(recoverDo func(ierr any)) {
+func (pe *ExecuteInterval[ITEM]) AsyncExecute() *ExecuteInterval[ITEM] {
+	pe.asyncExecuteInterval()
+	return pe
+}
+
+func (pe *ExecuteInterval[ITEM]) WithPeriodic(per time.Duration) *ExecuteInterval[ITEM] {
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+
+	pe.periodic = per
+	return pe
+}
+
+func (pe *ExecuteInterval[ITEM]) WithRecover(recoverDo func(ierr any)) *ExecuteInterval[ITEM] {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
 	pe.recoverDo = recoverDo
+	return pe
 }
 
 // Collect 收集数据
-func (pe *ExecuteInterval[ITEM]) Collect(item *ITEM) {
+func (pe *ExecuteInterval[ITEM]) Collect(item ITEM) {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 	pe.items = append(pe.items, item)
@@ -108,9 +129,4 @@ func (pe *ExecuteInterval[ITEM]) Collect(item *ITEM) {
 // Stop 停止执行
 func (pe *ExecuteInterval[ITEM]) Stop() {
 	pe.execStatus.Store(0)
-	<-pe.stopSignal
-
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	pe.once = &sync.Once{}
 }

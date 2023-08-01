@@ -17,7 +17,7 @@ func TestA1(t *testing.T) {
 	})
 
 	for i := 0; i < 30; i++ {
-		CountBoy.Notify(nil)
+		CountBoy.Notify(CountBoy.NULL)
 		time.Sleep(time.Millisecond * 100)
 	}
 
@@ -36,10 +36,10 @@ func TestA2(t *testing.T) {
 		time.Sleep(time.Second)
 	})
 
-	CountBoy.SetConcurrentNum(2)
+	CountBoy.WithConcurrentNum(2)
 
 	for i := 0; i < 30; i++ {
-		CountBoy.Notify(nil)
+		CountBoy.Notify(0)
 		time.Sleep(time.Millisecond * 100)
 	}
 

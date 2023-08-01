@@ -11,11 +11,11 @@ import (
 type ExecuteCompensate[ITEM any] struct {
 	periodic time.Duration // 周期的时间
 
-	items []*ITEM
+	items []ITEM
 	mu    sync.Mutex
 
 	// 要执行的函数
-	execDo func(i int, item *ITEM)
+	execDo func(i int, item ITEM)
 
 	// 错误恢复函数
 	recoverDo func(ierr any)
@@ -25,17 +25,14 @@ type ExecuteCompensate[ITEM any] struct {
 	// 是否打印恢复日志
 	isShowLog  atomic.Bool
 	execStatus atomic.Uint64
-	stopSignal chan struct{}
 }
 
-func NewExecuteCompensate[ITEM any](periodic time.Duration, execDo func(i int, item *ITEM)) *ExecuteCompensate[ITEM] {
+func NewExecuteCompensate[ITEM any](execDo func(i int, item ITEM)) *ExecuteCompensate[ITEM] {
 	e := &ExecuteCompensate[ITEM]{
-		periodic:   periodic,
-		execDo:     execDo,
-		once:       &sync.Once{},
-		stopSignal: make(chan struct{}),
+		periodic: time.Millisecond * 100,
+		execDo:   execDo,
+		once:     &sync.Once{},
 	}
-	e.asyncExecuteCompensate()
 	return e
 }
 
@@ -73,21 +70,18 @@ func (pe *ExecuteCompensate[ITEM]) batchHandler() {
 	}
 }
 
-func (pe *ExecuteCompensate[ITEM]) SetRecover(recoverDo func(ierr any)) {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-
-	pe.recoverDo = recoverDo
-}
-
 func (pe *ExecuteCompensate[ITEM]) asyncExecuteCompensate() {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
 	// 总执行时间 >= 周期时间 如果执行时间大于周期时间,执行后马上执行
 	go pe.once.Do(func() {
+		pe.execStatus.Store(1)
 		defer func() {
-			pe.stopSignal <- struct{}{}
+			pe.mu.Lock()
+			pe.once = &sync.Once{}
+			pe.mu.Unlock()
+			pe.execStatus.CompareAndSwap(1, 0)
 		}()
 
 		for pe.execStatus.Load() != 0 {
@@ -103,8 +97,29 @@ func (pe *ExecuteCompensate[ITEM]) asyncExecuteCompensate() {
 	})
 }
 
+func (pe *ExecuteCompensate[ITEM]) WithRecover(recoverDo func(ierr any)) *ExecuteCompensate[ITEM] {
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+
+	pe.recoverDo = recoverDo
+	return pe
+}
+
+func (pe *ExecuteCompensate[ITEM]) WithPeriodic(per time.Duration) *ExecuteCompensate[ITEM] {
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+
+	pe.periodic = per
+	return pe
+}
+
+func (pe *ExecuteCompensate[ITEM]) AsyncExecute() *ExecuteCompensate[ITEM] {
+	pe.asyncExecuteCompensate()
+	return pe
+}
+
 // Collect 收集数据
-func (pe *ExecuteCompensate[ITEM]) Collect(item *ITEM) {
+func (pe *ExecuteCompensate[ITEM]) Collect(item ITEM) {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 	pe.items = append(pe.items, item)
@@ -113,9 +128,4 @@ func (pe *ExecuteCompensate[ITEM]) Collect(item *ITEM) {
 // Stop 停止执行
 func (pe *ExecuteCompensate[ITEM]) Stop() {
 	pe.execStatus.Store(0)
-	<-pe.stopSignal
-
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	pe.once = &sync.Once{}
 }

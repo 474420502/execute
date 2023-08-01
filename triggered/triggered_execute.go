@@ -6,9 +6,11 @@ import (
 	"sync/atomic"
 )
 
-// EventExecute封装了一个执行单元
+// EventExecute封装了一个执行单元, 默认是不启动,需要Notify通知触发. 属于被动触发式
 // 包含执行函数,恢复函数和相关控制参数
 type EventExecute[PARAMS any] struct {
+	NULL PARAMS
+
 	mu sync.Mutex
 	// counter用来记录通知次数
 	counter int64
@@ -49,30 +51,33 @@ func (s *Shared) Value(do func(v any)) {
 }
 
 type Params[T any] struct {
-	Value  *T
+	Value  T
 	Shared *Shared
 }
 
-func (e *EventExecute[PARAMS]) SetRecover(recoverDo func(ierr any)) {
+func (e *EventExecute[PARAMS]) WithRecover(recoverDo func(ierr any)) *EventExecute[PARAMS] {
 	// 加锁
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	e.recoverDo = recoverDo
+	return e
 }
 
-func (e *EventExecute[PARAMS]) SetShared(v any) {
+func (e *EventExecute[PARAMS]) WithShared(v any) *EventExecute[PARAMS] {
 	// 加锁
 
 	e.shared.SetValue(v)
+	return e
 }
 
-func (e *EventExecute[PARAMS]) SetConcurrentNum(v int64) {
+func (e *EventExecute[PARAMS]) WithConcurrentNum(v int64) *EventExecute[PARAMS] {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	e.executeConcurrentLimit = v
+	return e
 }
 
 // RegisterExecute注册一个执行单元
@@ -93,7 +98,7 @@ func RegisterExecute[PARAMS any](execDo func(params *Params[PARAMS])) *EventExec
 // Notify用于通知触发执行
 // 根据事件号查找执行单元并检查通知次数
 // 达到指定次数则触发goroutine异步执行
-func (exec *EventExecute[PARAMS]) Notify(params *PARAMS) {
+func (exec *EventExecute[PARAMS]) Notify(params PARAMS) {
 
 	// 原子加1并检查通知次数
 
