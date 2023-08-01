@@ -1,7 +1,6 @@
 package triggered
 
 import (
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -12,22 +11,24 @@ import (
 // 并且具有错误恢复和保护能力
 
 // Event定义了事件类型,Uint32可以支持多达40亿个事件
-type Event uint32
+// type Event uint32
 
-// eventExecute封装了一个执行单元
+// EventExecute封装了一个执行单元
 // 包含执行函数,恢复函数和相关控制参数
-type eventExecute[PARAMS any] struct {
-
+type EventExecute[PARAMS any] struct {
+	mu sync.Mutex
 	// counter用来记录通知次数
-	counter atomic.Uint64
+	counter int64
 
 	// 达到指定通知次数时触发执行
-	notifyOverCountToExecute uint64
+	notifyOverCountToExecute int64
+	executeConcurrentLimit   int64
+	executeConcurrent        int64
 
 	// 是否打印恢复日志
 	isShowLog atomic.Bool
 
-	shared any
+	shared Shared
 	// 要执行的函数
 	execDo func(params *Params[PARAMS])
 
@@ -35,114 +36,102 @@ type eventExecute[PARAMS any] struct {
 	recoverDo func(ierr any)
 }
 
+type Shared struct {
+	value any // 值传递会复制
+	slock sync.Mutex
+}
+
+func (s *Shared) SetValue(v any) {
+	s.slock.Lock()
+	defer s.slock.Unlock()
+
+	s.value = v
+}
+
+func (s *Shared) Value(do func(v any)) {
+	s.slock.Lock()
+	defer s.slock.Unlock()
+
+	do(s.value)
+}
+
 type Params[T any] struct {
 	Value  *T
-	Shared any
+	Shared *Shared
 }
 
 // EventTriggeredExecute 包含已注册的执行事件列表
-type EventTriggeredExecute[PARAMS any] struct {
+// type EventTriggeredExecute[PARAMS any] struct {
 
-	// 互斥锁保护events切片
-	mu sync.Mutex
+// 	// 互斥锁保护events切片
+// 	mu sync.Mutex
 
-	// 已注册的执行事件列表
-	events []*eventExecute[PARAMS]
-}
+// 	// 已注册的执行事件列表
+// 	events []*EventExecute[PARAMS]
+// }
 
 // NewEventTriggeredExecute构造函数
-func NewEventTriggeredExecute[PARAMS any]() *EventTriggeredExecute[PARAMS] {
-	return &EventTriggeredExecute[PARAMS]{}
+// func NewEventTriggeredExecute[PARAMS any]() *EventTriggeredExecute[PARAMS] {
+// 	return &EventTriggeredExecute[PARAMS]{}
+// }
+
+func (e *EventExecute[PARAMS]) SetShared(v any) {
+	// 加锁
+
+	e.shared.SetValue(v)
 }
 
-func (be *EventTriggeredExecute[PARAMS]) SetShared(e Event, v any) {
-	// 加锁
-	be.mu.Lock()
-	defer be.mu.Unlock()
+func (e *EventExecute[PARAMS]) SetConcurrentNum(v int64) {
 
-	be.events[e].shared = v
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.executeConcurrentLimit = v
 }
 
 // RegisterExecute注册一个执行单元
 // 返回分配的事件号
-func (be *EventTriggeredExecute[PARAMS]) RegisterExecute(execDo func(params *Params[PARAMS]), recoverDo func(ierr any)) Event {
-
-	// 加锁
-	be.mu.Lock()
-
-	// 释放锁
-	defer be.mu.Unlock()
+func RegisterExecute[PARAMS any](execDo func(params *Params[PARAMS]), recoverDo func(ierr any)) *EventExecute[PARAMS] {
 
 	// 构造执行单元
-	ee := &eventExecute[PARAMS]{
+	ee := &EventExecute[PARAMS]{
 		notifyOverCountToExecute: 1,
+		executeConcurrentLimit:   1,
 		execDo:                   execDo,
 		recoverDo:                recoverDo,
 	}
 
-	// 添加到events列表
-	be.events = append(be.events, ee)
-
-	// 返回事件号
-	return Event(len(be.events) - 1)
-}
-
-// CoverExecute用来覆盖一个已注册的执行单元
-// 通过事件号定位并替换为新函数
-func (be *EventTriggeredExecute[PARAMS]) CoverExecute(e Event, execDo func(params *Params[PARAMS]), recoverDo func(ierr any)) {
-
-	// 加锁
-	be.mu.Lock()
-
-	// 释放锁
-	defer be.mu.Unlock()
-
-	// 构造新的执行单元
-	ee := &eventExecute[PARAMS]{
-		notifyOverCountToExecute: 1,
-		execDo:                   execDo,
-		recoverDo:                recoverDo,
-	}
-
-	// 通过事件号替换执行单元
-	be.events[e] = ee
+	return ee
 }
 
 // Notify用于通知触发执行
 // 根据事件号查找执行单元并检查通知次数
 // 达到指定次数则触发goroutine异步执行
-func (be *EventTriggeredExecute[PARAMS]) Notify(e Event, params *PARAMS) {
-
-	// 事件号转索引
-	ei := int(e)
-
-	// 加锁
-	be.mu.Lock()
-
-	// 检查事件号合法性
-	if len(be.events) < ei {
-		panic(fmt.Errorf("event is not exists"))
-	}
-
-	// 获取执行单元
-	exec := be.events[ei]
-
-	// 释放锁
-	be.mu.Unlock()
+func (exec *EventExecute[PARAMS]) Notify(params *PARAMS) {
 
 	// 原子加1并检查通知次数
-	if exec.counter.Add(1) == exec.notifyOverCountToExecute {
 
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+
+	exec.counter++
+	var ok = (exec.counter >= exec.notifyOverCountToExecute) && exec.executeConcurrent < exec.executeConcurrentLimit
+	if ok {
+		exec.executeConcurrent++
 		// 异步goroutine执行
 		go func() {
 
-			// 执行完成置0
-			defer exec.counter.Store(0)
-
 			// recover保护
 			defer func() {
-				if ierr := recover(); ierr != nil {
 
+				defer func() {
+					exec.mu.Lock()
+					exec.counter = 0         // reset
+					exec.executeConcurrent-- // 执行数量减1
+					exec.mu.Unlock()
+				}()
+
+				if ierr := recover(); ierr != nil {
 					// 打印错误堆栈
 					if exec.isShowLog.Load() {
 						log.Println(ierr)
@@ -157,9 +146,10 @@ func (be *EventTriggeredExecute[PARAMS]) Notify(e Event, params *PARAMS) {
 
 			// 执行已注册函数
 			exec.execDo(&Params[PARAMS]{
-				Shared: exec.shared,
+				Shared: &exec.shared,
 				Value:  params,
 			})
 		}()
+
 	}
 }
