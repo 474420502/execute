@@ -1,5 +1,3 @@
-好的,我再次学习了periodic执行器的代码后,来尝试给出一个更完善的readme文档:
-
 # Periodic Executor
 
 Periodic Executor是一个可配置的周期性任务执行器,支持多种执行模式。

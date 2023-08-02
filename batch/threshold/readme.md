@@ -1,5 +1,3 @@
-好的,我学习了上面的threshold执行器代码后,来尝试为它编写readme文档:
-
 # Threshold Executor
 
 Threshold Executor是一个基于阈值的批量执行器。它支持当数据积累到一定阈值或周期到达时触发执行。
