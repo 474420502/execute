@@ -98,8 +98,8 @@ func RegisterExecute[PARAMS any](execDo func(params *Params[PARAMS])) *EventExec
 	return ee
 }
 
-// RefCount 引用计数, 如果引用为0, 则不触发. 返回当前的引用计数
-func (exec *EventExecute[PARAMS]) RefCount(count int64) int64 {
+// RefCountAdd 引用计数, 如果引用为0, 则不触发. 返回当前的引用计数
+func (exec *EventExecute[PARAMS]) RefCountAdd(count int64) int64 {
 	exec.mu.Lock()
 	defer exec.mu.Unlock()
 	exec.refCount += count
