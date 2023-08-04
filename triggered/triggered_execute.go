@@ -14,6 +14,8 @@ type EventExecute[PARAMS any] struct {
 	mu sync.Mutex
 	// counter用来记录通知次数
 	counter int64
+	// 引用计数
+	refCount int64
 
 	// 达到指定通知次数时触发执行
 	notifyOverCountToExecute int64
@@ -95,6 +97,17 @@ func RegisterExecute[PARAMS any](execDo func(params *Params[PARAMS])) *EventExec
 	return ee
 }
 
+// RefCount 引用计数, 如果引用为0, 则不触发. 返回当前的引用计数
+func (exec *EventExecute[PARAMS]) RefCount(count int64) int64 {
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	exec.refCount += count
+	if exec.refCount < 0 {
+		exec.refCount = 0
+	}
+	return exec.refCount
+}
+
 // Notify用于通知触发执行
 // 根据事件号查找执行单元并检查通知次数
 // 达到指定次数则触发goroutine异步执行
@@ -104,6 +117,10 @@ func (exec *EventExecute[PARAMS]) Notify(params PARAMS) {
 
 	exec.mu.Lock()
 	defer exec.mu.Unlock()
+
+	if exec.refCount <= 0 {
+		return
+	}
 
 	exec.counter++
 	var ok = (exec.counter >= exec.notifyOverCountToExecute) && exec.executeConcurrent < exec.executeConcurrentLimit
