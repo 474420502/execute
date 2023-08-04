@@ -91,6 +91,7 @@ func RegisterExecute[PARAMS any](execDo func(params *Params[PARAMS])) *EventExec
 		notifyOverCountToExecute: 1,
 		executeConcurrentLimit:   1,
 		execDo:                   execDo,
+		refCount:                 1,
 		// recoverDo:                recoverDo,
 	}
 
