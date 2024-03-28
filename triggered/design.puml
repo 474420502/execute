@@ -1,0 +1,25 @@
+@startuml
+title EventExecute 程序逻辑
+
+participant "RegisterExecute" as RegisterExecute
+participant "EventExecute" as EventExecute
+participant "loopExecute" as LoopExecute
+
+RegisterExecute -> EventExecute : 创建 EventExecute 实例
+EventExecute -> LoopExecute : 启动 loopExecute
+
+LoopExecute -> LoopExecute : 无限循环
+LoopExecute -> LoopExecute : 等待事件
+EventExecute -> LoopExecute : Notify(params)
+LoopExecute -> LoopExecute : 缓存 params
+LoopExecute -> LoopExecute : 检查缓存是否为空
+opt 缓存不为空
+    LoopExecute -> LoopExecute : 执行 execDo
+    LoopExecute -> LoopExecute : 清空缓存
+end
+
+EventExecute -> EventExecute : Close()
+EventExecute -> LoopExecute : 发送停止信号
+LoopExecute -> LoopExecute : 退出循环
+
+@enduml
