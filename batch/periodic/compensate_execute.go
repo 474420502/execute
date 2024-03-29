@@ -2,130 +2,132 @@ package periodic
 
 import (
 	"log"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/474420502/execute/utils"
 )
 
-// ExecuteCompensate 时间补偿执行
+// ExecuteCompensate 时间补偿执行, chan size必须设置足够大, 超过就阻塞. 防止内存溢出
+// 时间补偿, 只要时间差不够就必须等到时间差
 type ExecuteCompensate[ITEM any] struct {
-	periodic time.Duration // 周期的时间
-
-	items []ITEM
-	mu    sync.Mutex
-
-	// 要执行的函数
-	execDo func(i int, item ITEM)
-
-	// 错误恢复函数
-	recoverDo func(ierr any)
-
-	once *sync.Once
-
-	// 是否打印恢复日志
-	isShowLog  atomic.Bool
-	execStatus atomic.Uint64
+	sub *executeCompensateSub[ITEM]
 }
 
-func NewExecuteCompensate[ITEM any](execDo func(i int, item ITEM)) *ExecuteCompensate[ITEM] {
+type executeCompensateSub[ITEM any] struct {
+	periodic atomic.Int64
+
+	// 要执行的函数
+	execDo func(item ITEM)
+
+	loopExecuteOnce sync.Once
+	stopChan        chan struct{}
+	stopOnce        utils.OnceNoWait
+	itemsChan       chan ITEM
+}
+
+func NewExecuteCompensate[ITEM any](execDo func(item ITEM)) *ExecuteCompensate[ITEM] {
 	e := &ExecuteCompensate[ITEM]{
-		periodic: time.Millisecond * 100,
-		execDo:   execDo,
-		once:     &sync.Once{},
+		sub: &executeCompensateSub[ITEM]{
+			// periodic: time.Millisecond * 100,
+			itemsChan: make(chan ITEM, 1<<16),
+			execDo:    execDo,
+		},
 	}
+	e.sub.periodic.Store(int64(time.Millisecond) * 100)
+
+	e.loopExecute()
+
+	runtime.SetFinalizer(e, func(ee *ExecuteCompensate[ITEM]) {
+		// 停止循环执行
+		ee.Close()
+	})
+
 	return e
 }
 
-func (pe *ExecuteCompensate[ITEM]) batchHandler() {
-
-	pe.mu.Lock()
-	items := pe.items[:]
-	pe.items = pe.items[:0]
-	pe.mu.Unlock()
-
-	for i, item := range items {
-		func() {
-			// recover保护
-			defer func() {
-				if ierr := recover(); ierr != nil {
-
-					// 打印错误堆栈
-					if pe.isShowLog.Load() {
-						log.Println(ierr)
-					}
-
-					pe.mu.Lock()
-					recoverDo := pe.recoverDo
-					pe.mu.Unlock()
-
-					// 调用恢复函数
-					if recoverDo != nil {
-						recoverDo(ierr)
-					}
-				}
-			}()
-
-			pe.execDo(i, item)
-		}()
-	}
-}
-
-func (pe *ExecuteCompensate[ITEM]) asyncExecuteCompensate() {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-
-	// 总执行时间 >= 周期时间 如果执行时间大于周期时间,执行后马上执行
-	go pe.once.Do(func() {
-		pe.execStatus.Store(1)
-		defer func() {
-			pe.mu.Lock()
-			pe.once = &sync.Once{}
-			pe.mu.Unlock()
-			pe.execStatus.CompareAndSwap(1, 0)
-		}()
-
-		for pe.execStatus.Load() != 0 {
-			now := time.Now()
-
-			pe.batchHandler()
-
-			sub := time.Since(now)
-			if sub < pe.periodic {
-				time.Sleep(pe.periodic - sub)
-			}
-		}
-	})
-}
-
-func (pe *ExecuteCompensate[ITEM]) WithRecover(recoverDo func(ierr any)) *ExecuteCompensate[ITEM] {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-
-	pe.recoverDo = recoverDo
-	return pe
-}
-
 func (pe *ExecuteCompensate[ITEM]) WithPeriodic(per time.Duration) *ExecuteCompensate[ITEM] {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
 
-	pe.periodic = per
-	return pe
-}
-
-func (pe *ExecuteCompensate[ITEM]) AsyncExecute() *ExecuteCompensate[ITEM] {
-	pe.asyncExecuteCompensate()
+	pe.sub.periodic.Store(int64(per))
 	return pe
 }
 
 // Collect 收集数据
-func (pe *ExecuteCompensate[ITEM]) Collect(item ITEM) {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	pe.items = append(pe.items, item)
+func (exec *ExecuteCompensate[ITEM]) Collect(item ITEM) {
+	exec.sub.itemsChan <- item
 }
 
 // Stop 停止执行
-func (pe *ExecuteCompensate[ITEM]) Stop() {
-	pe.execStatus.Store(0)
+func (exec *ExecuteCompensate[ITEM]) Close() {
+	exec.sub.stopOnce.Do(func() {
+		close(exec.sub.stopChan)
+		close(exec.sub.itemsChan)
+	})
+
+}
+
+func (exec *ExecuteCompensate[ITEM]) loopExecute() {
+	sub := exec.sub
+	sub.loopExecuteOnce.Do(func() {
+
+		go func() {
+
+			var items []ITEM
+
+			for {
+				select {
+				case <-sub.stopChan:
+					// 收到停止信号，退出循环
+					return
+				case item := <-sub.itemsChan:
+					// log.Println(" param := <-exec.params 1 ")
+					items = append(items, item)
+
+					func() {
+						for {
+
+							select {
+							case item := <-sub.itemsChan:
+								// log.Println(" param := <-exec.params 2 ")
+								items = append(items, item)
+							default:
+								func() {
+									if len(items) == 0 {
+										return
+									}
+									// recover保护
+									defer func() {
+										if ierr := recover(); ierr != nil {
+											log.Println(ierr)
+										}
+									}()
+
+									now := time.Now()
+
+									for _, item := range items {
+										sub.execDo(item)
+									}
+									items = items[:0]
+
+									// 时间补偿, 只要时间差不够就必须等到时间差
+									subtime := time.Since(now)
+									periodic := time.Duration(sub.periodic.Load())
+									if subtime < periodic {
+										time.Sleep(periodic - subtime)
+									}
+								}()
+								return
+							}
+						}
+
+					}()
+
+				}
+
+			}
+
+		}()
+	})
 }

@@ -22,7 +22,7 @@ func TestEventExecute(t *testing.T) {
 	)
 
 	// 创建一个执行单元，其中执行函数将更新执行计数和参数记录
-	exec := RegisterExecute[any](func(params *Params[any]) {
+	exec := RegisterExecute[any](func(params *Items[any]) {
 		executed++
 		receivedParams = append(receivedParams, params.Value...)
 	})
@@ -62,7 +62,7 @@ func TestEventExecute(t *testing.T) {
 
 func TestNotify(t *testing.T) {
 	var executed bool
-	execFunc := func(params *Params[int]) {
+	execFunc := func(params *Items[int]) {
 		executed = true
 	}
 
@@ -78,7 +78,7 @@ func TestNotify(t *testing.T) {
 }
 
 func TestWithShared(t *testing.T) {
-	execFunc := func(params *Params[int]) {
+	execFunc := func(params *Items[int]) {
 		params.Shared.Value(func(v any) {
 			if v.(string) != "test" {
 				t.Errorf("Expected shared value 'test', got %v", v)
@@ -97,7 +97,7 @@ func TestWithShared(t *testing.T) {
 
 func TestMultipleNotify(t *testing.T) {
 	var count int
-	execFunc := func(params *Params[int]) {
+	execFunc := func(params *Items[int]) {
 		count += len(params.Value)
 	}
 
@@ -139,7 +139,7 @@ func TestSetFinalizer(t *testing.T) {
 	var o *utils.OnceNoWait
 	func() {
 		var count int
-		execFunc := func(params *Params[int]) {
+		execFunc := func(params *Items[int]) {
 			count += len(params.Value)
 		}
 

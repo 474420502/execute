@@ -2,131 +2,127 @@ package periodic
 
 import (
 	"log"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/474420502/execute/utils"
 )
 
-// ExecuteInterval 时间间隔执行
+// ExecuteInterval 时间补偿执行, chan size必须设置足够大, 超过就阻塞. 防止内存溢出
+// 时间补偿, 只要时间差不够就必须等到时间差
 type ExecuteInterval[ITEM any] struct {
-	periodic time.Duration // 周期的时间
-
-	items []ITEM
-	mu    sync.Mutex
-
-	// 要执行的函数
-	execDo func(i int, item ITEM)
-
-	// 错误恢复函数
-	recoverDo func(ierr any)
-
-	once *sync.Once
-
-	// 是否打印恢复日志
-	isShowLog  atomic.Bool
-	execStatus atomic.Uint64
-	stopSignal chan struct{}
+	sub *executeIntervalSub[ITEM]
 }
 
-func NewExecuteInterval[ITEM any](execDo func(i int, item ITEM)) *ExecuteInterval[ITEM] {
+type executeIntervalSub[ITEM any] struct {
+	periodic atomic.Int64
+
+	// 要执行的函数
+	execDo func(item ITEM)
+
+	loopExecuteOnce sync.Once
+	stopChan        chan struct{}
+	stopOnce        utils.OnceNoWait
+	itemsChan       chan ITEM
+}
+
+func NewExecuteInterval[ITEM any](execDo func(item ITEM)) *ExecuteInterval[ITEM] {
 	e := &ExecuteInterval[ITEM]{
-		periodic:   time.Millisecond * 100,
-		execDo:     execDo,
-		once:       &sync.Once{},
-		stopSignal: make(chan struct{}),
+		sub: &executeIntervalSub[ITEM]{
+			// periodic: time.Millisecond * 100,
+			itemsChan: make(chan ITEM, 1<<16),
+			execDo:    execDo,
+		},
 	}
-	e.asyncExecuteInterval()
+	e.sub.periodic.Store(int64(time.Millisecond) * 100)
+
+	e.loopExecute()
+
+	runtime.SetFinalizer(e, func(ee *ExecuteInterval[ITEM]) {
+		// 停止循环执行
+		ee.Close()
+	})
+
 	return e
 }
 
-func (pe *ExecuteInterval[ITEM]) batchHandler() {
-
-	pe.mu.Lock()
-	items := pe.items[:]
-	pe.items = pe.items[:0]
-	pe.mu.Unlock()
-
-	for i, item := range items {
-		func() {
-			// recover保护
-			defer func() {
-				if ierr := recover(); ierr != nil {
-
-					// 打印错误堆栈
-					if pe.isShowLog.Load() {
-						log.Println(ierr)
-					}
-
-					pe.mu.Lock()
-					recoverDo := pe.recoverDo
-					pe.mu.Unlock()
-
-					// 调用恢复函数
-					if recoverDo != nil {
-						recoverDo(ierr)
-					}
-				}
-			}()
-
-			pe.execDo(i, item)
-		}()
-	}
-}
-
-func (pe *ExecuteInterval[ITEM]) asyncExecuteInterval() {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-
-	//  总执行时间 = 周期时间 + 执行时间
-	go pe.once.Do(func() {
-		pe.execStatus.Store(1)
-		defer func() {
-			pe.mu.Lock()
-			pe.once = &sync.Once{}
-			pe.mu.Unlock()
-			pe.execStatus.CompareAndSwap(1, 0)
-		}()
-
-		for pe.execStatus.Load() != 0 {
-			pe.mu.Lock()
-			periodic := pe.periodic
-			pe.mu.Unlock()
-
-			pe.batchHandler()
-			time.Sleep(periodic)
-		}
-	})
-}
-
-func (pe *ExecuteInterval[ITEM]) AsyncExecute() *ExecuteInterval[ITEM] {
-	pe.asyncExecuteInterval()
-	return pe
-}
-
 func (pe *ExecuteInterval[ITEM]) WithPeriodic(per time.Duration) *ExecuteInterval[ITEM] {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
 
-	pe.periodic = per
-	return pe
-}
-
-func (pe *ExecuteInterval[ITEM]) WithRecover(recoverDo func(ierr any)) *ExecuteInterval[ITEM] {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-
-	pe.recoverDo = recoverDo
+	pe.sub.periodic.Store(int64(per))
 	return pe
 }
 
 // Collect 收集数据
-func (pe *ExecuteInterval[ITEM]) Collect(item ITEM) {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	pe.items = append(pe.items, item)
+func (exec *ExecuteInterval[ITEM]) Collect(item ITEM) {
+	exec.sub.itemsChan <- item
 }
 
 // Stop 停止执行
-func (pe *ExecuteInterval[ITEM]) Stop() {
-	pe.execStatus.Store(0)
+func (exec *ExecuteInterval[ITEM]) Close() {
+	exec.sub.stopOnce.Do(func() {
+		close(exec.sub.stopChan)
+		close(exec.sub.itemsChan)
+	})
+
+}
+
+func (exec *ExecuteInterval[ITEM]) loopExecute() {
+	sub := exec.sub
+	sub.loopExecuteOnce.Do(func() {
+
+		go func() {
+
+			var items []ITEM
+
+			for {
+				select {
+				case <-sub.stopChan:
+					// 收到停止信号，退出循环
+					return
+				case item := <-sub.itemsChan:
+					// log.Println(" param := <-exec.params 1 ")
+					items = append(items, item)
+
+					func() {
+						for {
+
+							select {
+							case item := <-sub.itemsChan:
+								// log.Println(" param := <-exec.params 2 ")
+								items = append(items, item)
+							default:
+								func() {
+									if len(items) == 0 {
+										return
+									}
+									// recover保护
+									defer func() {
+										if ierr := recover(); ierr != nil {
+											log.Println(ierr)
+										}
+									}()
+
+									for _, item := range items {
+										sub.execDo(item)
+									}
+									items = items[:0]
+
+									periodic := time.Duration(sub.periodic.Load())
+									time.Sleep(periodic)
+
+								}()
+								return
+							}
+						}
+
+					}()
+
+				}
+
+			}
+
+		}()
+	})
 }
