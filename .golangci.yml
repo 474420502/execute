@@ -1,0 +1,47 @@
+# golangci-lint 配置(可选工具, CI 不强制依赖).
+#
+# 本地使用:
+#   go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+#   golangci-lint run ./...
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - revive
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - gocritic
+    - nilerr
+    - prealloc
+    - unconvert
+    - whitespace
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported
+        disabled: true # 中文注释由本仓库维护者评审, 不强制英文风格
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - performance
+    disabled-checks:
+      - hugeParam
+
+issues:
+  exclude-rules:
+    # 测试与示例允许较宽松的写法.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gocritic
+        - prealloc

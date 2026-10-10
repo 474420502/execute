@@ -1,73 +1,82 @@
-# Periodic Executor
+# Periodic Executor 周期执行器
 
-Periodic Executor是一个可配置的周期性任务执行器,支持多种执行模式。
-
-## 特性
-
-- 定时执行模式
-  - 固定间隔循环执行
-  - 执行时间补偿模式
-  - 定期批量并发模式
-- 数据收集与执行解耦
-- 错误处理及恢复机制
-- 执行控制
-  - 支持启动、停止
-  - 执行状态跟踪
-- 高性能
-  - 利用channel、锁、原子操作实现并发安全
-
-## 用法
-
-### 创建执行器
+按时间驱动的执行器, 提供三种执行语义。三者共享同一套采集、生命周期与观测能力,
+差异只在 **何时执行** 与 **如何执行**。
 
 ```go
-executor := NewExecuteInterval(handlerFunc)
+import "github.com/474420502/execute/batch/periodic"
 ```
 
-传入执行函数。
+## 三种模式
 
-### 配置
-
-可配置执行周期、错误恢复等: 
+| 构造 | 模式 | 执行语义 | 适用场景 |
+| --- | --- | --- | --- |
+| `NewInterval(handler, d)` | `Interval` | 每 `d` 把缓冲区数据作为一个批次执行; 批次超时则丢拍 | 常规批量落库、定时聚合 |
+| `NewCompensate(handler, d)` | `Compensate` | 按截止时刻对齐, 批次耗时超过 `d` 时立即开始下一批, 长期平均速率 = `1/d` | 需要稳定节拍(例如采样、限速器) |
+| `NewConcurrent(handler, d, n)` | `Concurrent` | 每 `d` 取走一批, 交给最多 `n` 个 worker 并发执行 | 单批耗时长、想用并发提高吞吐 |
 
 ```go
-executor.WithPeriodic(dur)
-executor.WithRecover(recoverFunc)
+// 每 100ms 批量写入一次
+exec := periodic.NewInterval[Order](func(batch []Order) error {
+    return db.BatchInsert(batch)
+}, 100*time.Millisecond)
+defer exec.Wait(nil)
+
+exec.Collect(order1)
+exec.Collect(order2)
 ```
 
-### 数据收集 
+## 关键行为
 
-```go 
-executor.Collect(data)
-```
+- **不产生空批次**: 缓冲区为空时不会调用 `Handler`。
+- **顺序保持**: 同一批次内数据顺序与投递顺序一致, 且不会重复。
+- **数据切片复用**: `Handler` 的入参仅在本次调用内有效, 需要保留请 `slices.Clone`。
+- **`Flush()`**: 立即执行当前缓冲区。`Concurrent` 模式下不等待已派发的 worker,
+  需要完全同步请用 `Wait(ctx)`。
+- **`Compensate` 的慢启动语义**: 数据到达时若距上次执行不足一个周期, 会等到截止时刻
+  才执行, 因此不会超过上游速率, 也不会累积漂移。
 
-分离收集和执行。
-
-### 执行
+## 配置
 
 ```go
-executor.AsyncExecute() 
+exec.WithPeriodic(50 * time.Millisecond)  // 热更新周期(下一个网格点生效)
+exec.WithConcurrentNum(8)                 // 仅 Concurrent: 热更新并发上限
+exec.WithMaxPending(1 << 20)              // 缓冲区积压上限, 超出即丢弃并计数
+exec.WithBackpressure(engine.BackpressureDrop) // 队列满时丢弃而不是阻塞
+exec.WithRecover(func(ierr any) { log.Println(ierr) })
+exec.WithOnExecute(func(ev periodic.ExecuteEvent) { metrics.Observe(ev) })
+
+// 需要更细粒度控制时可直接使用引擎选项
+exec.Configure(
+    engine.WithQueueSize[int](1<<16),
+    engine.WithBackpressure[int](engine.BackpressureBlock),
+    engine.WithName[int]("order-writer"),
+)
 ```
 
-支持三种模式:
-
-- IntervalLoop - 固定间隔循环执行
-- Compensate - 执行时间补偿模式
-- Concurrent - 定期批量并发模式
-
-### 控制
+## 生命周期
 
 ```go
-executor.Stop() // 停止执行
+exec.Start()        // 显式启动(通常无需调用, 首次 Collect 会自动启动)
+exec.Pause()        // 暂停: 继续接收数据但不触发执行(返回后立即生效)
+exec.Resume()
+exec.Flush()        // 立即执行缓冲区
+exec.Close()        // 优雅关闭, 幂等
+exec.Wait(ctx)      // 等待在途任务与残留数据处理完毕
+exec.Status()       // created / running / paused / closing / stopped
+exec.Stats()        // 接收/处理/成功/失败/丢弃/在途 + 最近错误
 ```
 
-## 自定义执行器
+关闭后 `Collect` 返回 `periodic.ErrClosed`(等价于 `basic.ErrClosed`), 不会 panic。
 
-实现 Executor 接口即可实现自定义执行器集成使用。
+## 并发上限如何被保证
 
-## TODO
+`Concurrent` 模式用信号量限制"同时在途的批次数"。并发上限可以在运行期调整:
 
-- [ ] 增加详细文档
-- [ ] 支持动态配置更改
+```go
+exec.WithConcurrentNum(16) // 扩容: 立即生效
+exec.WithConcurrentNum(1)  // 缩容: 不剥夺已在执行的批次, 空闲后自动收敛
+```
 
-欢迎报告issue或提交PR!
+`TestConcurrentBoundedParallelism` 会验证在处理阻塞的情况下, 进入处理器的批次数量
+绝不超过配置上限。

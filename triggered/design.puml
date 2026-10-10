@@ -1,25 +1,55 @@
 @startuml
-title EventExecute 程序逻辑
+title 通用任务执行器: 采集与执行解耦
 
-participant "RegisterExecute" as RegisterExecute
-participant "EventExecute" as EventExecute
-participant "loopExecute" as LoopExecute
+skinparam packageStyle rectangle
+skinparam shadowing false
 
-RegisterExecute -> EventExecute : 创建 EventExecute 实例
-EventExecute -> LoopExecute : 启动 loopExecute
+package "业务侧(任意 goroutine)" as Biz {
+  [Collect / Notify / TryCollect]
+}
 
-LoopExecute -> LoopExecute : 无限循环
-LoopExecute -> LoopExecute : 等待事件
-EventExecute -> LoopExecute : Notify(params)
-LoopExecute -> LoopExecute : 缓存 params
-LoopExecute -> LoopExecute : 检查缓存是否为空
-opt 缓存不为空
-    LoopExecute -> LoopExecute : 执行 execDo
-    LoopExecute -> LoopExecute : 清空缓存
-end
+package "公共契约 basic" as Basic {
+  interface "Executor[ITEM]" as Executor
+  [Handler[ITEM]]
+  [Status]
+  [Stats]
+  [Semaphore]
+  [Errors]
+}
 
-EventExecute -> EventExecute : Close()
-EventExecute -> LoopExecute : 发送停止信号
-LoopExecute -> LoopExecute : 退出循环
+package "执行引擎 basic/engine (内部)" as Engine {
+  [有界采集队列\n(阻塞 | 丢弃)]
+  [唯一 dispatcher goroutine]
+  [批次缓冲区]
+  [批次路由\nperiodic / size / arrival]
+  [并发 worker 池\n(Semaphore 限流)]
+  [指标与错误记录]
+  [可重配置定时网格 delayQueue]
+}
+
+package "执行器实现" as Impl {
+  [batch/periodic\nInterval | Compensate | Concurrent]
+  [batch/threshold\n数量阈值 + 周期兜底]
+  [triggered\n到达即执行]
+}
+
+Biz --> Executor : 只投递数据
+Executor --> Engine : 统一实现
+Impl ..|> Executor
+
+Engine --> [Handler[ITEM]] : 批次回调(copy 语义: 切片复用)
+Engine --> [Stats] : 只读快照
+Engine --> [Status] : created/running/paused/closing/stopped
+
+note right of [唯一 dispatcher goroutine]
+  所有可变业务状态由 dispatcher 独占:
+  - 采集热路径无需互斥锁
+  - 批次划分、阈值判定、并发派发都在此串行决策
+end note
+
+note bottom of [并发 worker 池\n(Semaphore 限流)]
+  并发上限可在运行期热更新:
+  扩容/缩容都不会剥夺在途批次的额度
+end note
 
 @enduml

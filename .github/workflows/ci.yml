@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+env:
+  # 依赖 Go 1.24+ 的泛型类型别名; 1.25+ 提供稳定的 testing/synctest.
+  GOTOOLCHAIN: local
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ["1.25.x", "1.26.x", "1.27.x"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: 显示 Go 版本
+        run: go version
+
+      - name: 校验依赖与格式
+        run: |
+          go mod verify
+          gofmt -l . | tee /tmp/gofmt.out
+          test ! -s /tmp/gofmt.out
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: 单元测试(含竞态检测)
+        run: go test -race -count=1 -timeout 300s ./...
+
+  bench:
+    name: benchmark smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 基准测试冒烟
+        run: go test -run XXX -bench . -benchtime 100x ./...
