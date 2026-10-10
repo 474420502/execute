@@ -10,6 +10,9 @@
 //
 // 三者都满足"采集与执行解耦": 业务侧只调用 Collect, 不感知执行时机与并发度;
 // 关闭后 Collect 返回 error 而不会 panic.
+//
+// 常规用法选择语义化的构造函数(NewInterval / NewCompensate / NewConcurrent);
+// 需要按配置驱动(模式、队列容量、背压等)时使用 NewFromConfig。
 package periodic
 
 import (
@@ -23,8 +26,31 @@ import (
 // Handler 是周期执行器的业务回调. items 仅在下一次执行前有效, 需要保留请自行复制.
 type Handler[ITEM any] = basic.Handler[ITEM]
 
+// Mode 是周期执行器的执行语义。
+type Mode = engine.Mode
+
+// Backpressure 是队列满时的行为(阻塞或丢弃)。
+type Backpressure = engine.Backpressure
+
+const (
+	// ModeInterval 固定节奏: 每个周期执行一次(允许丢拍)。
+	ModeInterval = engine.ModeInterval
+	// ModeCompensate 固定速率补偿: 批次超时也不漂移。
+	ModeCompensate = engine.ModeCompensate
+	// ModeConcurrent 并发批量: 每个周期派发一批给 worker 池。
+	ModeConcurrent = engine.ModeConcurrent
+
+	// BackpressureBlock 队列满时阻塞投递(默认, 不丢数据)。
+	BackpressureBlock = engine.BackpressureBlock
+	// BackpressureDrop 队列满时丢弃并计数, 不阻塞调用方。
+	BackpressureDrop = engine.BackpressureDrop
+)
+
 // ExecuteEvent 是批次执行结果的观测事件(等价于 basic.ExecuteEvent).
 type ExecuteEvent = basic.ExecuteEvent
+
+// DropEvent 是数据被丢弃时的观测事件(等价于 basic.DropEvent).
+type DropEvent = basic.DropEvent
 
 // RecoverFunc 是 panic 恢复回调(等价于 basic.RecoverFunc).
 type RecoverFunc = basic.RecoverFunc
@@ -51,7 +77,39 @@ func HandlerOf[ITEM any](fn Func[ITEM]) Handler[ITEM] {
 	}
 }
 
-// Interval 是固定节奏执行器.
+// Config 是周期执行器的完整创建配置, 用于需要精细控制(队列容量、背压、名称等)的场景。
+type Config[ITEM any] struct {
+	// Handler 是业务回调, 必填。
+	Handler Handler[ITEM]
+	// Mode 选择执行语义, 默认 ModeInterval。
+	Mode Mode
+	// Interval 是执行周期, 必填(> 0)。
+	Interval time.Duration
+	// Concurrency 仅 ModeConcurrent 使用, <=0 时取 runtime.NumCPU()。
+	Concurrency int
+
+	// QueueSize 是采集队列容量; <=0 时使用引擎默认值 65536。
+	// 队列越小, 背压越早作用于上游。
+	QueueSize int
+	// BufferCap 是批次缓冲区的初始容量; <=0 时自动推导。
+	BufferCap int
+
+	// Backpressure 决定队列满时的行为, 默认阻塞(BackpressureBlock)。
+	Backpressure Backpressure
+	// MaxPending 限制缓冲区积压上限, <=0 表示不限制。
+	MaxPending int
+
+	// Recover 在 Handler panic 时被调用(可选)。
+	Recover RecoverFunc
+	// OnExecute 在每次批次执行完成后同步回调(可选, 必须轻量)。
+	OnExecute func(ExecuteEvent)
+	// OnDrop 在每次丢弃数据时同步回调(可选, 必须轻量)。
+	OnDrop func(DropEvent)
+	// Name 用于日志与指标标识。
+	Name string
+}
+
+// NewInterval 创建固定节奏执行器.
 //
 // 事件循环: 每到 Interval 就把缓冲区中的数据整体取出执行一次; 缓冲区为空时跳过,
 // 因此空闲期间不会产生空执行.
@@ -104,6 +162,42 @@ func NewConcurrent[ITEM any](handler Handler[ITEM], interval time.Duration, conc
 	e := mustEngine(engine.ModeConcurrent, handler, interval,
 		engine.WithConcurrency[ITEM](concurrency))
 	return setFinalizer(&Concurrent[ITEM]{Engine: e})
+}
+
+// NewFromConfig 使用完整配置创建周期执行器, 适合需要精细控制队列与背压的场景。
+//
+// Mode 为空值时按 ModeInterval 处理; Handler 与 Interval 必填。
+func NewFromConfig[ITEM any](cfg Config[ITEM]) *Expr[ITEM] {
+	if cfg.Handler == nil {
+		panic("periodic: handler must not be nil")
+	}
+	if cfg.Interval <= 0 {
+		panic("periodic: interval must be > 0")
+	}
+	mode := cfg.Mode
+	if mode < ModeInterval || mode > ModeConcurrent {
+		// 只允许周期类模式; Trigger/Threshold 属于其他执行器。
+		mode = ModeInterval
+	}
+
+	e, err := engine.New(engine.Config[ITEM]{
+		Handler:      cfg.Handler,
+		Mode:         mode,
+		Interval:     cfg.Interval,
+		Concurrency:  cfg.Concurrency,
+		QueueSize:    cfg.QueueSize,
+		BufferCap:    cfg.BufferCap,
+		Backpressure: engine.Backpressure(cfg.Backpressure),
+		MaxPending:   cfg.MaxPending,
+		Recover:      cfg.Recover,
+		OnExecute:    cfg.OnExecute,
+		OnDrop:       cfg.OnDrop,
+		Name:         cfg.Name,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return setFinalizer(&Expr[ITEM]{Engine: e})
 }
 
 func mustEngine[ITEM any](mode engine.Mode, handler Handler[ITEM], interval time.Duration, opts ...engine.Option[ITEM]) *engine.Engine[ITEM] {

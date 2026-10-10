@@ -395,3 +395,69 @@ func TestHandlerOf(t *testing.T) {
 		}
 	})
 }
+
+// TestNewFromConfig 覆盖按配置创建: 模式、并发、队列容量、背压都生效.
+func TestNewFromConfig(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var (
+			mu   sync.Mutex
+			got  []int
+			done = make(chan struct{})
+		)
+		e := periodic.NewFromConfig(periodic.Config[int]{
+			Handler: func(items []int) error {
+				mu.Lock()
+				got = append(got, items...)
+				n := len(got)
+				mu.Unlock()
+				if n == 4 {
+					close(done)
+				}
+				return nil
+			},
+			Mode:         periodic.ModeConcurrent,
+			Interval:     5 * time.Millisecond,
+			Concurrency:  2,
+			QueueSize:    8, // 精细控制队列容量
+			Backpressure: periodic.BackpressureBlock,
+			Name:         "from-config",
+		})
+		t.Cleanup(func() { _ = e.Wait(nil) })
+
+		for i := range 4 {
+			if err := e.Collect(i); err != nil {
+				t.Fatalf("Collect error: %v", err)
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		synctest.Wait()
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("NewFromConfig 创建的执行器未执行")
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(got) != 4 {
+			t.Fatalf("应处理 4 条, 实际 %v", got)
+		}
+	})
+}
+
+// TestNewFromConfigInvalid 非法配置必须在构造期就暴露, 而不是运行期静默出错.
+func TestNewFromConfigInvalid(t *testing.T) {
+	for name, cfg := range map[string]periodic.Config[int]{
+		"nil-handler": {Interval: time.Second},
+		"zero-period": {Handler: func([]int) error { return nil }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("非法配置应 panic")
+				}
+			}()
+			periodic.NewFromConfig(cfg)
+		})
+	}
+}

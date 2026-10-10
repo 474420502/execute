@@ -69,6 +69,21 @@ exec := periodic.NewCompensate[Item](handler, 100*time.Millisecond)
 exec.WithPeriodic(50 * time.Millisecond)
 ```
 
+需要精细控制队列容量/背压等创建期参数时, 使用配置结构:
+
+```go
+exec := periodic.NewFromConfig(periodic.Config[Item]{
+    Handler:      handler,
+    Mode:         periodic.ModeConcurrent,
+    Interval:     100 * time.Millisecond,
+    Concurrency:  8,
+    QueueSize:    1 << 12,                    // 采集队列容量(影响背压施加时机)
+    Backpressure: periodic.BackpressureDrop,  // 队列满时丢弃而不是阻塞
+    OnExecute:    func(ev periodic.ExecuteEvent) { metrics.Observe(ev) },
+    Name:         "order-writer",
+})
+```
+
 ### 2. 阈值执行器
 
 ```go
@@ -140,7 +155,8 @@ log.Printf("processed=%d failed=%d dropped=%d inFlight=%d",
    `Stats().DroppedItems` / `OnDrop` 观测:
 
    ```go
-   exec.Configure(engine.WithBackpressure[int](engine.BackpressureDrop))
+   exec.WithBackpressure(periodic.BackpressureDrop) // 或创建时通过 Config.Backpressure 指定
+   exec.Configure(engine.WithMaxPending[int](1 << 20))
    ```
 
 7. **关闭语义(不丢数据)**

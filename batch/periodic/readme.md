@@ -42,16 +42,21 @@ exec.Collect(order2)
 exec.WithPeriodic(50 * time.Millisecond)  // 热更新周期(下一个网格点生效)
 exec.WithConcurrentNum(8)                 // 仅 Concurrent: 热更新并发上限
 exec.WithMaxPending(1 << 20)              // 缓冲区积压上限, 超出即丢弃并计数
-exec.WithBackpressure(engine.BackpressureDrop) // 队列满时丢弃而不是阻塞
+exec.WithBackpressure(periodic.BackpressureDrop) // 队列满时丢弃而不是阻塞
 exec.WithRecover(func(ierr any) { log.Println(ierr) })
 exec.WithOnExecute(func(ev periodic.ExecuteEvent) { metrics.Observe(ev) })
 
-// 需要更细粒度控制时可直接使用引擎选项
-exec.Configure(
-    engine.WithQueueSize[int](1<<16),
-    engine.WithBackpressure[int](engine.BackpressureBlock),
-    engine.WithName[int]("order-writer"),
-)
+// 需要在创建时精细控制队列容量/背压/名称, 使用配置结构
+exec := periodic.NewFromConfig(periodic.Config[Order]{
+    Handler:      handler,
+    Mode:         periodic.ModeConcurrent,
+    Interval:     100 * time.Millisecond,
+    Concurrency:  8,
+    QueueSize:    1 << 12, // 采集队列容量: 越小, 背压越早作用于上游
+    Backpressure: periodic.BackpressureBlock,
+    OnExecute:    func(ev periodic.ExecuteEvent) { metrics.Observe(ev) },
+    Name:         "order-writer",
+})
 ```
 
 ## 生命周期
