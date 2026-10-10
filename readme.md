@@ -34,7 +34,8 @@ exec.Collect(order)
 
 - **采集与执行解耦**: `Collect/Notify` 只入队; 执行策略由执行器决定。
 - **不会 panic 的关闭语义**: `Close()` 幂等, 关闭后投递返回 `basic.ErrClosed`。
-- **可同步等待**: `Wait(ctx)` 等待在途任务与残留数据处理完毕, 不丢数据。
+- **关闭不丢数据**: `Close()` 会把"已接收但尚未执行"的数据执行完; 任意时刻满足
+  `接收 = 处理 + 丢弃 + 缓冲区`。`Wait(ctx)` 可同步等待全部结束。
 - **背压可控**: 队列满时默认阻塞, 也可切换为"丢弃并计数"(`engine.BackpressureDrop`)。
 - **运行期热更新**: 周期、阈值、并发上限、背压策略、处理器均可随时修改, 下一轮生效。
 - **panic 隔离**: 处理器 panic 会被捕获、计数并回调 `RecoverFunc`, 执行循环不中断。
@@ -142,7 +143,18 @@ log.Printf("processed=%d failed=%d dropped=%d inFlight=%d",
    exec.Configure(engine.WithBackpressure[int](engine.BackpressureDrop))
    ```
 
-7. **panic 与错误**
+7. **关闭语义(不丢数据)**
+   `Collect`/`Notify` 成功返回即代表数据已被接收。`Close()` 会先把队列中的残留数据
+   合并进缓冲区再执行: 阻塞策略下等到执行完, 丢弃策略下未处理的计入 `DroppedItems`。
+   因此恒有:
+
+   ```
+   Stats().ReceivedItems == ProcessedItems + DroppedItems + PendingItems
+   ```
+
+   这条不变式由 `TestEdgeCloseLosslessDrain` 在全部五种模式下逐条验证。
+
+8. **panic 与错误**
    `Handler` 返回 `error` 会被记录为一次失败执行; panic 会被捕获, 触发 `RecoverFunc`
    并记录堆栈, 执行循环继续运行。因此单个坏数据不会拖垮整个执行器。
 

@@ -81,6 +81,10 @@ const (
 	defaultQueueSize   = 1 << 16
 	defaultBufferCap   = 1024
 	defaultRecoverKeep = 8
+
+	// acquireWaitLimit 是"等待空闲 worker"的上限: 超过则丢弃并计数.
+	// 正常情况下 worker 归还 permit 会立即唤醒等待者, 该上限只是"绝不永久阻塞"的兜底。
+	acquireWaitLimit = 30 * time.Second
 )
 
 // Config 是执行引擎的完整配置.
@@ -331,10 +335,13 @@ type Engine[ITEM any] struct {
 	cfgmu sync.RWMutex
 	cfg   runConfig[ITEM]
 
-	cmds       chan cmd[ITEM]
-	phase      atomic.Int32
-	closed     atomic.Bool
-	stopSignal chan struct{}
+	cmds   chan cmd[ITEM]
+	phase  atomic.Int32
+	closed atomic.Bool
+	// shuttingDown 仅在 dispatcher 收尾阶段为 true: 表示"不再接收新数据, 但必须把
+	// 已接收的数据执行完".
+	shuttingDown atomic.Bool
+	stopSignal   chan struct{}
 	// stopCtx 在 stopSignal 关闭时被取消, 用于中断信号量等待.
 	stopCtx  context.Context
 	stopFn   context.CancelFunc
@@ -706,7 +713,16 @@ func (e *Engine[ITEM]) Status() basic.Status { return basic.Status(e.phase.Load(
 // Done 返回在 dispatcher 完全退出后关闭的通道.
 func (e *Engine[ITEM]) Done() <-chan struct{} { return e.loopDone }
 
-// Close 优雅关闭: 幂等, 不阻塞等待执行结束; 残留数据会在退出前尽力执行一次.
+// Close 优雅关闭: 幂等, 不阻塞等待执行结束.
+//
+// 关闭语义(重要):
+//   - 停止接收新数据(之后的 Collect 返回 ErrClosed);
+//   - 已经进入队列的数据会先被合并进缓冲区, 再按背压策略执行:
+//     阻塞策略下会一直等到执行完(绝不静默丢数据), 丢弃策略下未处理的会计入 DroppedItems;
+//   - 因此不存在"数据凭空消失": 任意时刻都满足
+//     ReceivedItems == ProcessedItems + DroppedItems + PendingItems。
+//
+// 需要同步等待全部结束请使用 Wait。
 func (e *Engine[ITEM]) Close() {
 	if !e.closed.CompareAndSwap(false, true) {
 		return
@@ -720,6 +736,9 @@ func (e *Engine[ITEM]) Close() {
 		e.completeOnce.Do(func() { close(e.loopDone) })
 	})
 
+	// 先标记"收尾中": 已经进入信号量等待的批次会改用有界等待而不是立即放弃,
+	// 这样"已经接收的数据"不会因为正在关闭而丢失。
+	e.shuttingDown.Store(true)
 	e.stopFn()
 	close(e.stopSignal)
 	if started {
@@ -904,14 +923,43 @@ func (e *Engine[ITEM]) applyPhase(target basic.Status) {
 	}
 }
 
-// shutdown 是 dispatcher 退出前的收尾: 尽力执行残留数据.
+// shutdown 是 dispatcher 退出前的收尾: 必须先把"已经入队但尚未被处理"的数据
+// 全部合并进缓冲区, 再尽力执行一次, 最后丢弃实在无法处理的部分。
+//
+// 这一步是"优雅关闭不丢数据"的关键: Collect 只负责把数据放进队列, 因此关闭时
+// 队列里可能还积压着已经投递成功的数据, 不能直接退出。
 func (e *Engine[ITEM]) shutdown() {
-	trigger := TriggerPeriodic
-	if e.mode == ModeThreshold {
-		trigger = TriggerPeriodic // 收尾一律走周期/兜底处理器
+	e.shuttingDown.Store(true)
+
+	// 1) 排空命令队列(含已入队的数据), 把它们合并进缓冲区.
+drainCmds:
+	for {
+		select {
+		case c := <-e.cmds:
+			switch c.kind {
+			case cmdValue:
+				e.received.Add(1)
+				e.pushBuffer(c.value)
+			case cmdFlush:
+				if c.ack != nil {
+					c.ack <- nil
+				}
+			case cmdPhase:
+				if c.release != nil {
+					close(c.release)
+				}
+			}
+		default:
+			break drainCmds
+		}
 	}
+
+	// 2) 尽力执行缓冲区中的残留数据(handler 可能又产生新数据, 因此执行两轮).
+	trigger := TriggerPeriodic
 	e.flushOwned(trigger, true)
-	e.flushOwned(trigger, true) // 执行期间可能又落进少量数据(比如被唤醒的采集者)
+	e.flushOwned(trigger, true)
+
+	// 3) 仍然处理不完的部分只能丢弃并计数(不再静默丢失).
 	e.drainBuffer()
 }
 
@@ -1075,29 +1123,39 @@ func (e *Engine[ITEM]) drainBuffer() {
 	}
 }
 
-// submit 派发一个并发批次.
+// submit 派发一个并发批次; 并发上限由信号量保证.
+//
+// 语义(与背压策略一一对应):
+//   - allowWait == true(阻塞策略): 等待空闲 worker, 绝不静默丢数据。
+//     即使已经进入关闭流程也照样等 —— 因为数据在 Collect 成功时就已经"被接收",
+//     关闭只意味着不再接收新数据, 而不是丢弃已接收的数据。
+//   - allowWait == false(丢弃策略): 没有空闲 worker 就丢弃并计数, 绝不阻塞。
+//
+// 等待都带超时上限, 保证异常情况下 Close/Wait 仍能结束。
 func (e *Engine[ITEM]) submit(handler basic.Handler[ITEM], items []ITEM, blocking, allowWait bool) error {
-	switch {
-	case blocking && allowWait:
-		// 背压: 等待一个空闲 worker; 关闭时不再等待, 直接同步执行避免静默丢数据.
-		acquired, err := e.slot.Acquire(e.stopCtx)
-		if err != nil {
-			// 关闭过程中不再等待 worker: 尊重并发上限, 丢弃本批次并计数,
-			// 而不是让 dispatcher 亲自同步执行(那会突破并发上限).
-			e.dropBatch("closing", items)
-			return basic.ErrClosed
-		}
-		if !acquired {
-			return nil
-		}
-	default:
-		// 丢弃策略: 没有空闲 worker 就丢弃本批次.
-		if !e.slot.TryAcquire() {
-			e.dropBatch("workers-busy", items)
+	if blocking && allowWait {
+		ctx, cancel := context.WithTimeout(context.Background(), acquireWaitLimit)
+		ok, err := e.slot.Acquire(ctx)
+		cancel()
+		if err != nil || !ok {
+			e.dropBatch("workers-busy-timeout", items)
 			return basic.ErrQueueFull
 		}
+		e.spawn(handler, items)
+		return nil
 	}
 
+	// 丢弃策略: 没有空闲 worker 就丢弃本批次.
+	if !e.slot.TryAcquire() {
+		e.dropBatch("workers-busy", items)
+		return basic.ErrQueueFull
+	}
+	e.spawn(handler, items)
+	return nil
+}
+
+// spawn 启动一个 worker 执行批次, 并负责在结束时归还 permit.
+func (e *Engine[ITEM]) spawn(handler basic.Handler[ITEM], items []ITEM) {
 	e.inflight.Add(1)
 	e.inFlight.Add(1)
 	go func() {
@@ -1108,7 +1166,6 @@ func (e *Engine[ITEM]) submit(handler basic.Handler[ITEM], items []ITEM, blockin
 		}()
 		e.runHandler(handler, items)
 	}()
-	return nil
 }
 
 // runHandler 是唯一真正调用用户回调的地方, 负责 panic 隔离、指标与观测.
