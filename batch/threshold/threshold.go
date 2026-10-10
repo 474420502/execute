@@ -22,6 +22,19 @@ type Handler[ITEM any] = basic.Handler[ITEM]
 // ExecuteEvent 是批次执行结果的观测事件(等价于 basic.ExecuteEvent).
 type ExecuteEvent = basic.ExecuteEvent
 
+// DropEvent 是数据被丢弃时的观测事件(等价于 basic.DropEvent).
+type DropEvent = basic.DropEvent
+
+// Backpressure 是队列/并发槽位不足时的行为(阻塞或丢弃).
+type Backpressure = engine.Backpressure
+
+const (
+	// BackpressureBlock 队列满时阻塞投递(默认, 不丢数据).
+	BackpressureBlock = engine.BackpressureBlock
+	// BackpressureDrop 队列满时丢弃并计数, 不阻塞调用方.
+	BackpressureDrop = engine.BackpressureDrop
+)
+
 // RecoverFunc 是 panic 恢复回调(等价于 basic.RecoverFunc).
 type RecoverFunc = basic.RecoverFunc
 
@@ -62,6 +75,84 @@ type ThresholdExecute[ITEM any] struct {
 
 // 编译期契约检查.
 var _ basic.Executor[int] = (*ThresholdExecute[int])(nil)
+
+// Config 是阈值执行器的完整创建配置, 用于需要精细控制队列容量与背压的场景。
+type Config[ITEM any] struct {
+	// Handler 是默认处理器(同时作为数量阈值与周期兜底两条路径的默认值), 必填。
+	Handler Handler[ITEM]
+	// BatchSize 是数量阈值, <=0 时取默认值 128。
+	BatchSize int
+	// Periodic 是周期兜底间隔, <=0 时取默认值 100ms。
+	Periodic time.Duration
+	// SizeHandler 覆盖"达到数量阈值"路径的处理器(可选)。
+	SizeHandler Handler[ITEM]
+	// PeriodicHandler 覆盖"周期兜底"路径的处理器(可选)。
+	PeriodicHandler Handler[ITEM]
+
+	// QueueSize 是采集队列容量; <=0 时使用引擎默认值 65536。
+	QueueSize int
+	// BufferCap 是批次缓冲区初始容量; <=0 时自动推导。
+	BufferCap int
+	// Backpressure 决定队列满时的行为, 默认阻塞。
+	Backpressure Backpressure
+	// MaxPending 限制缓冲区积压上限, <=0 表示不限制。
+	MaxPending int
+
+	// Recover 在 Handler panic 时被调用(可选)。
+	Recover RecoverFunc
+	// OnExecute 在每次批次执行完成后同步回调(可选, 必须轻量)。
+	OnExecute func(ExecuteEvent)
+	// OnDrop 在每次丢弃数据时同步回调(可选, 必须轻量)。
+	OnDrop func(DropEvent)
+	// Name 用于日志与指标标识。
+	Name string
+}
+
+// NewFromConfig 使用完整配置创建阈值执行器。
+func NewFromConfig[ITEM any](cfg Config[ITEM]) *ThresholdExecute[ITEM] {
+	if cfg.Handler == nil {
+		panic("threshold: handler must not be nil")
+	}
+	batchSize := cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = defaultBatchSize
+	}
+	periodic := cfg.Periodic
+	if periodic <= 0 {
+		periodic = defaultPeriodic
+	}
+	sizeDo := cfg.SizeHandler
+	if sizeDo == nil {
+		sizeDo = cfg.Handler
+	}
+	periodicDo := cfg.PeriodicHandler
+	if periodicDo == nil {
+		periodicDo = cfg.Handler
+	}
+
+	e, err := engine.New(engine.Config[ITEM]{
+		Handler:         cfg.Handler,
+		PeriodicHandler: periodicDo,
+		SizeHandler:     sizeDo,
+		Mode:            engine.ModeThreshold,
+		Interval:        periodic,
+		BatchSize:       batchSize,
+		QueueSize:       cfg.QueueSize,
+		BufferCap:       cfg.BufferCap,
+		Backpressure:    engine.Backpressure(cfg.Backpressure),
+		MaxPending:      cfg.MaxPending,
+		Recover:         cfg.Recover,
+		OnExecute:       cfg.OnExecute,
+		OnDrop:          cfg.OnDrop,
+		Name:            cfg.Name,
+	})
+	if err != nil {
+		panic(err)
+	}
+	exec := &ThresholdExecute[ITEM]{Engine: e}
+	runtime.SetFinalizer(exec, func(x *ThresholdExecute[ITEM]) { x.Close() })
+	return exec
+}
 
 // NewThresholdExecute 创建阈值执行器.
 //
@@ -112,6 +203,24 @@ func (exec *ThresholdExecute[ITEM]) WithPeriodicHandler(handler Handler[ITEM]) *
 	return exec
 }
 
+// WithBackpressure 设置背压策略(阻塞或丢弃), 运行期可热更新.
+func (exec *ThresholdExecute[ITEM]) WithBackpressure(bp Backpressure) *ThresholdExecute[ITEM] {
+	exec.Configure(engine.WithBackpressure[ITEM](bp))
+	return exec
+}
+
+// WithMaxPending 设置缓冲区积压上限(<=0 表示不限制), 运行期可热更新.
+func (exec *ThresholdExecute[ITEM]) WithMaxPending(n int) *ThresholdExecute[ITEM] {
+	exec.Configure(engine.WithMaxPending[ITEM](n))
+	return exec
+}
+
+// WithOnDrop 设置丢弃数据时的观测回调(同步调用, 需保持轻量).
+func (exec *ThresholdExecute[ITEM]) WithOnDrop(fn func(DropEvent)) *ThresholdExecute[ITEM] {
+	exec.Configure(engine.WithOnDrop[ITEM](fn))
+	return exec
+}
+
 // WithRecover 设置 panic 恢复回调.
 func (exec *ThresholdExecute[ITEM]) WithRecover(fn basic.RecoverFunc) *ThresholdExecute[ITEM] {
 	exec.Configure(engine.WithRecover[ITEM](fn))
@@ -119,7 +228,7 @@ func (exec *ThresholdExecute[ITEM]) WithRecover(fn basic.RecoverFunc) *Threshold
 }
 
 // WithOnExecute 设置批次执行完成观测回调(同步调用, 需保持轻量).
-func (exec *ThresholdExecute[ITEM]) WithOnExecute(fn func(basic.ExecuteEvent)) *ThresholdExecute[ITEM] {
+func (exec *ThresholdExecute[ITEM]) WithOnExecute(fn func(ExecuteEvent)) *ThresholdExecute[ITEM] {
 	exec.Configure(engine.WithOnExecute[ITEM](fn))
 	return exec
 }

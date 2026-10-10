@@ -309,3 +309,102 @@ func TestHandlerOf(t *testing.T) {
 		waitFor(t, time.Second, "HandlerOf 生效", func() bool { return got.Load() == 2 })
 	})
 }
+
+// TestNewFromConfig 按配置创建: 队列容量、背压、双处理器路由都生效.
+func TestNewFromConfig(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var (
+			mu      sync.Mutex
+			bySize  []int
+			byTick  []int
+			dropped atomic.Int64
+		)
+		e := threshold.NewFromConfig(threshold.Config[int]{
+			Handler: func(items []int) error {
+				mu.Lock()
+				bySize = append(bySize, items...)
+				mu.Unlock()
+				return nil
+			},
+			BatchSize: 2,
+			Periodic:  20 * time.Millisecond,
+			PeriodicHandler: func(items []int) error {
+				mu.Lock()
+				byTick = append(byTick, items...)
+				mu.Unlock()
+				return nil
+			},
+			QueueSize:    64,
+			Backpressure: threshold.BackpressureDrop,
+			OnDrop:       func(threshold.DropEvent) { dropped.Add(1) },
+			Name:         "threshold-from-config",
+		})
+		t.Cleanup(func() { _ = e.Wait(nil) })
+
+		for i := range 3 { // 2 条触发数量阈值, 剩 1 条由周期兜底
+			if err := e.Collect(i); err != nil {
+				t.Fatalf("Collect error: %v", err)
+			}
+		}
+		waitFor(t, time.Second, "数量阈值路径执行", func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(bySize) == 2
+		})
+		waitFor(t, 2*time.Second, "周期兜底执行", func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(byTick) == 1
+		})
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(bySize) != 2 || len(byTick) != 1 {
+			t.Fatalf("处理器路由错误: size=%v tick=%v", bySize, byTick)
+		}
+	})
+}
+
+// TestNewFromConfigNilHandler 缺处理器必须在构造期 panic.
+func TestNewFromConfigNilHandler(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("handler 为 nil 时应 panic")
+		}
+	}()
+	threshold.NewFromConfig(threshold.Config[int]{})
+}
+
+// TestBackpressureDrop 丢弃策略下不得阻塞调用方, 且丢弃被计数.
+func TestBackpressureDrop(t *testing.T) {
+	gate := make(chan struct{})
+	var entered sync.Once
+	inHandler := make(chan struct{})
+	e := threshold.NewThresholdExecute[int](func(items []int) error {
+		entered.Do(func() { close(inHandler) })
+		<-gate
+		return nil
+	}).WithBatchSize(1).WithPeriodic(time.Hour).WithBackpressure(threshold.BackpressureDrop)
+	t.Cleanup(func() {
+		close(gate)
+		_ = e.Wait(nil)
+	})
+
+	if err := e.TryCollect(0); err != nil {
+		t.Fatalf("TryCollect error: %v", err)
+	}
+	<-inHandler // 处理器卡住
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			_ = e.TryCollect(i) // 丢弃策略: 必须立即返回
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("丢弃策略下 TryCollect 不应阻塞")
+	}
+}
